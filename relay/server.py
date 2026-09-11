@@ -1,103 +1,3 @@
-"""CardMirror card-sharing relay — standalone, self-hostable.
-MongoDB storage backend (rewritten from the original Postgres/SQLAlchemy version).
-
-A content-agnostic store-and-forward mailbox with live push:
-
-  POST   /relay/messages              store one addressed (encrypted) bundle
-  GET    /relay/messages?recipient=   pull everything addressed to a code
-  GET    /relay/stream?recipient=     SSE push: live-delivers new bundles
-  DELETE /relay/messages/{msg_id}     acknowledge / remove one delivered bundle
-  GET    /relay/health                liveness (no auth)
-
-…plus durable ROOMS for collaboration sessions (opaque encrypted CRDT
-update logs with server-assigned delivery cursors):
-
-  POST   /relay/rooms                       create → {roomId}
-  POST   /relay/rooms/{id}/updates          append opaque blob → {seq}
-  GET    /relay/rooms/{id}/updates?after=N  snapshot (if N predates it) + tail
-  GET    /relay/rooms/{id}/stream           SSE: hello{lastSeq}, update/presence frames
-  POST   /relay/rooms/{id}/snapshot         {blob, coversThroughSeq} → truncates ≤ seq
-  POST   /relay/rooms/{id}/presence         ephemeral fan-out, never stored
-  DELETE /relay/rooms/{id}                  end session (tombstone → 410)
-
-This is the same wire contract CardMirror's official relay speaks, so
-pointing the app at your own deployment is just Settings → Card Sharing →
-Custom relay URL + Custom relay token. Everyone sharing cards with each
-other must use the same relay.
-
-WHAT CHANGED FROM THE POSTGRES VERSION:
-  - Storage is MongoDB instead of Postgres. Every SQLAlchemy model became
-    a Mongo collection; every `db.query(...)` became a pymongo find/
-    update call. The wire contract (the HTTP routes, request/response
-    shapes) is unchanged — this is a storage-layer rewrite only, not a
-    behavior change.
-  - `seq` (the room-update delivery cursor) can no longer come from a
-    SQL autoincrement column, since Mongo has no such thing. It's now
-    a manually-maintained atomic counter in a small `relay_counters`
-    collection, incremented with an atomic `$inc` — still a single
-    global monotonically-increasing integer, same semantics as before.
-  - Message expiry (the 3-hour TTL) is now enforced by a MongoDB TTL
-    index instead of a Python sweep loop — Mongo's background task
-    deletes expired documents on its own every ~60 seconds. The GET
-    /relay/messages query still also filters by cutoff itself, so a
-    message never gets served late even if Mongo's cleanup lags.
-  - Room idle-GC (tombstoning + eventually deleting rooms nobody's
-    touched in a week) still needs custom logic — Mongo TTL indexes
-    can't express "tombstone on day 7, then hard-delete on day 14" —
-    so that part keeps its own sweep loop, just querying Mongo instead
-    of Postgres.
-
-Design notes (unchanged from the original):
-  - Directed addressing: a sender POSTs to the recipient's routing code;
-    the recipient receives only its own code and never sends to itself,
-    so there is no self-echo.
-  - Store-then-push: POST writes the row first (durability), then
-    live-pushes to any open /relay/stream connections. Clients catch up
-    via GET on every (re)connect, so delivery is at-least-once and the
-    client's per-message dedupe absorbs overlap.
-  - The in-process push registry requires a SINGLE worker process (run
-    plain `uvicorn`, no --workers).
-  - DB-touching handlers are sync `def` on purpose: Starlette runs them
-    in its threadpool, keeping the blocking pymongo driver off the
-    event loop (which must stay free to serve SSE streams and accept
-    connections).
-
-Rooms design notes (unchanged from the original):
-  - `seq` is a delivery cursor, not a semantic order: CRDT updates are
-    commutative, so the server only promises "give me everything after
-    N" resumption. A global sequence shared across rooms is fine (gaps
-    within a room are expected and harmless).
-  - Compaction is the CLIENT's job (the server cannot read ciphertext):
-    a client periodically uploads an encrypted snapshot covering
-    everything through seq S; the server then deletes updates ≤ S.
-    Joins fetch snapshot + tail, bounding join time on large docs.
-  - Ended sessions tombstone (410, distinct from never-existed 404) so
-    clients can tell "session over" from "bad room id". Idle rooms are
-    garbage-collected after ROOM_IDLE_GC — generous by design: a
-    session legitimately spans a travel day + tournament weekend with
-    long fully-offline gaps.
-  - At most MAX_STREAMS_PER_ROOM concurrent streams per room (409 on
-    the next), which is also the participant ceiling.
-
-PRIVACY: the card payload is end-to-end encrypted by the CardMirror
-client. This server stores the bundle OPAQUELY (the `body` field) and
-must never log or inspect it — only routing codes, ids, and counts are
-ever touched here. Room update/snapshot/presence blobs are equally
-opaque ciphertext: store, forward, count — never decode.
-
-Env:
-  RELAY_TOKEN    required — the shared bearer your CardMirror clients
-                 configure as "Custom relay token".
-  MONGODB_URI    required — a MongoDB connection string, e.g.
-                 mongodb+srv://user:pass@cluster.mongodb.net
-                 (MongoDB Atlas's free tier gives you one of these.)
-  MONGODB_DB_NAME  optional (default "cardmirror_relay") — which
-                 database on that cluster to use.
-  PORT           optional (default 8000; the Dockerfile wires this up).
-  RELAY_CORS_ORIGINS  optional (default "*") — comma-separated allowed
-                 origins for browser/PWA collab clients. "*" is safe
-                 here (the auth is a bearer header, not a cookie).
-"""
 import asyncio
 import base64
 import gzip
@@ -122,8 +22,6 @@ from pymongo.errors import PyMongoError
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("relay")
 
-# ── Limits / lifecycle (unchanged from the original) ────────────────
-
 MAX_BYTES = 25 * 1024 * 1024  # decompressed payload cap
 MAX_COMPRESSED_BYTES = 30 * 1024 * 1024  # gzip-bomb guard
 TTL = timedelta(hours=3)
@@ -132,13 +30,11 @@ HEARTBEAT_SECONDS = 25
 STREAM_QUEUE_MAX = 100
 
 # Rooms (collaboration sessions)
-MAX_UPDATE_BYTES = 5 * 1024 * 1024        # one appended blob (chunked client-side above 256 KiB)
+MAX_UPDATE_BYTES = 50 * 1024 * 1024        # one appended blob (chunked client-side above 256 KiB)
 ROOM_CAP_BYTES = 200 * 1024 * 1024        # total stored per room (updates + snapshot)
 MAX_UPDATES_PER_PAGE = 200
 MAX_STREAMS_PER_ROOM = 10                 # participant ceiling, enforced at stream connect
-ROOM_IDLE_GC = timedelta(days=7)          # must exceed travel day + tournament weekend
-
-# ── Storage (MongoDB) ────────────────────────────────────────────────
+ROOM_IDLE_GC = timedelta(days=2)          # must exceed travel day + tournament weekend
 
 MONGODB_URI = os.getenv("MONGODB_URI")
 if not MONGODB_URI:
