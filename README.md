@@ -27,7 +27,7 @@ or locked-down school machine.
 > **Desktop builds are unsigned**, so Windows and macOS warn you the
 > first time you launch. The one-time workaround for each is in the
 > install steps below.
-
+See [`SETUP.md`](./SETUP.md) for config.
 See [`MANUAL.md`](./MANUAL.md) for the full user
 manual; [`PRIVACY.md`](./PRIVACY.md) for how CardMirror handles your data;
 [`TERMS.md`](./TERMS.md) for the terms of use;
