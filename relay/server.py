@@ -24,7 +24,7 @@ logger = logging.getLogger("relay")
 
 MAX_BYTES = 25 * 1024 * 1024
 MAX_COMPRESSED_BYTES = 30 * 1024 * 1024
-TTL = timedelta(hours=3)
+TTL = timedelta(hours=8)
 MAX_PER_POLL = 100
 HEARTBEAT_SECONDS = 25
 STREAM_QUEUE_MAX = 100
